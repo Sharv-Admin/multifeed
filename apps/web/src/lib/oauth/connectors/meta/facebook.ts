@@ -4,6 +4,7 @@ import {
   metaAuthorizeUrl,
   metaExchangeCode,
   metaListPages,
+  metaPageTokenExpiresAt,
   pagesToFacebookOptions,
 } from "./shared";
 
@@ -52,9 +53,9 @@ export const facebookConnector: SocialConnector = {
     const tokens: TokenBundle = {
       accessToken: pageAccessToken,
       refreshToken: userTokens.accessToken,
-      expiresAt: userTokens.expiresAt,
+      expiresAt: await metaPageTokenExpiresAt(pageAccessToken),
       refreshTokenExpiresAt: userTokens.expiresAt,
-      scopes: SCOPES,
+      scopes: userTokens.scopes,
       tokenType: "page",
     };
 

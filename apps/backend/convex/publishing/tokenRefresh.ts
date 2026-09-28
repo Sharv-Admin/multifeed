@@ -2,6 +2,7 @@
 
 import type { Doc } from "../_generated/dataModel";
 import { META_GRAPH } from "./apiVersions";
+import { decryptSecret } from "../oauth/crypto";
 
 export type RefreshedToken = {
   accessToken: string;
@@ -115,6 +116,27 @@ async function fetchJson(url: string, init: RequestInit = {}) {
   return { ok: res.ok, json };
 }
 
+async function inspectFacebookPageToken(accessToken: string) {
+  const appId = process.env.META_APP_ID;
+  const appSecret = process.env.META_APP_SECRET;
+  if (!appId || !appSecret) {
+    throw new Error("Convex is missing META_APP_ID or META_APP_SECRET");
+  }
+  const params = new URLSearchParams({ input_token: accessToken });
+  const { ok, json } = await fetchJson(`${META_GRAPH}/debug_token?${params}`, {
+    headers: { Authorization: `Bearer ${appId}|${appSecret}` },
+  });
+  if (!ok) throw new Error("Facebook Page token inspection failed");
+  const data = json.data as
+    | { is_valid?: boolean; expires_at?: number }
+    | undefined;
+  if (!data?.is_valid) return null;
+  return {
+    accessToken,
+    expiresAt: data.expires_at ? data.expires_at * 1000 : undefined,
+  };
+}
+
 async function refreshMetaPageToken(
   platform: "facebook" | "instagram",
   userToken: string,
@@ -140,6 +162,28 @@ async function refreshMetaPageToken(
       ? Date.now() + exchanged.json.expires_in * 1000
       : undefined;
 
+  if (platform === "facebook") {
+    // Fetch the selected Page directly, including Pages beyond /me/accounts' first page.
+    const page = await fetchJson(
+      `${META_GRAPH}/${providerAccountId}?fields=access_token`,
+      {
+        headers: { Authorization: `Bearer ${nextUserToken}` },
+      },
+    );
+    if (!page.ok) {
+      throwIfRejected(page.json, "Meta rejected this account's token");
+      return null;
+    }
+    if (typeof page.json.access_token !== "string") return null;
+    const inspected = await inspectFacebookPageToken(page.json.access_token);
+    if (!inspected) return null;
+    return {
+      ...inspected,
+      refreshToken: nextUserToken,
+      refreshTokenExpiresAt: expiresAt,
+    };
+  }
+
   const pages = await fetchJson(
     `${META_GRAPH}/me/accounts?fields=id,access_token,instagram_business_account&limit=100&access_token=${encodeURIComponent(nextUserToken)}`,
   );
@@ -151,7 +195,6 @@ async function refreshMetaPageToken(
 
   const page = (pages.json.data as Array<Record<string, unknown>>).find(
     (entry) => {
-      if (platform === "facebook") return entry.id === providerAccountId;
       const ig = entry.instagram_business_account as
         | { id?: string }
         | undefined;
@@ -174,6 +217,14 @@ export async function refreshAccessTokenForPlatform(
   account: Doc<"connectedAccounts">,
   refreshToken: string,
 ): Promise<RefreshedToken | null> {
+  if (account.platform === "facebook" && account.encryptedAccessToken) {
+    // Older connections incorrectly inherited the user token's expiration.
+    // Keep a valid Page token even when its backing user token has expired.
+    const accessToken = await decryptSecret(account.encryptedAccessToken);
+    const inspected = await inspectFacebookPageToken(accessToken);
+    if (inspected) return inspected;
+  }
+
   if (account.platform === "x") {
     const id = process.env.X_CLIENT_ID;
     const secret = process.env.X_CLIENT_SECRET;

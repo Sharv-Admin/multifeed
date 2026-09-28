@@ -133,6 +133,13 @@ export const publishAttempt = v.union(
   }),
   v.object({ kind: v.literal("facebook"), ...publishedResult }),
   v.object({
+    kind: v.literal("facebook_reel_video"),
+    videoId: v.string(),
+    uploadUrl: v.string(),
+    finishRequested: v.optional(v.boolean()),
+    ...publishedResult,
+  }),
+  v.object({
     kind: v.literal("facebook_story_video"),
     videoId: v.string(),
     pageId: v.string(),

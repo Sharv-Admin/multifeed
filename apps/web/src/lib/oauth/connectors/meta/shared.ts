@@ -126,6 +126,23 @@ export async function metaExchangeCode(input: {
   };
 }
 
+export async function metaPageTokenExpiresAt(accessToken: string) {
+  const { appId, appSecret } = metaAppCredentials();
+  const params = new URLSearchParams({ input_token: accessToken });
+  const res = await oauthFetch(`${GRAPH}/debug_token?${params}`, {
+    headers: bearerHeaders(`${appId}|${appSecret}`),
+  });
+  const result = (await res.json()) as {
+    data?: { is_valid?: boolean; expires_at?: number };
+    error?: { message?: string };
+  };
+  if (!res.ok || !result.data?.is_valid) {
+    throw new Error(result.error?.message ?? "Facebook Page token is invalid");
+  }
+  // Meta reports zero for tokens without a scheduled expiration.
+  return result.data.expires_at ? result.data.expires_at * 1000 : undefined;
+}
+
 export type MetaPage = {
   id: string;
   name: string;

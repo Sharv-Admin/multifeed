@@ -29,9 +29,12 @@ type GraphResponse = {
   status?: {
     video_status?: string;
     uploading_phase?: { status?: string };
+    processing_phase?: { status?: string };
+    publishing_phase?: { status?: string };
   };
   error?: { message?: string; code?: number };
   message?: string;
+  success?: boolean;
 };
 
 async function graphFetch(
@@ -70,10 +73,9 @@ async function facebookPermalink(
   accessToken: string,
   fallback: string,
 ) {
-  const data = await graphFetch(
-    `${GRAPH}/${id}?fields=permalink_url&access_token=${encodeURIComponent(accessToken)}`,
-    { method: "GET" },
-  ).catch((): GraphResponse => ({}));
+  const data = await graphFetch(`${GRAPH}/${id}?fields=permalink_url`, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  }).catch((): GraphResponse => ({}));
   return typeof data.permalink_url === "string" && data.permalink_url
     ? data.permalink_url
     : fallback;
@@ -91,6 +93,118 @@ async function facebookPublished(
   const permalink = await facebookPermalink(id, accessToken, fallback);
   await saveAttempt?.({ kind: "facebook", platformPostId: id, permalink });
   return { platformPostId: id, permalink };
+}
+
+async function publishFacebookReel(
+  params: PublishInput,
+): Promise<PublishedPost> {
+  const {
+    post,
+    target,
+    account,
+    media,
+    accessToken,
+    existingAttempt,
+    saveAttempt,
+  } = params;
+  const asset = media[0];
+  if (media.length !== 1 || asset?.kind !== "video") {
+    throw new Error("Facebook reels require one video");
+  }
+  const endpoint = `${GRAPH}/${account.providerAccountId}/video_reels`;
+  let attempt =
+    existingAttempt?.kind === "facebook_reel_video"
+      ? existingAttempt
+      : undefined;
+  let status: GraphResponse["status"];
+  if (!attempt) {
+    const started = await graphFetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        upload_phase: "start",
+        access_token: accessToken,
+      }),
+    });
+    if (!started.video_id || !started.upload_url) {
+      throw new Error("Facebook reel upload session missing");
+    }
+    attempt = {
+      kind: "facebook_reel_video",
+      videoId: started.video_id,
+      uploadUrl: started.upload_url,
+    };
+    await saveAttempt?.(attempt);
+  } else {
+    const response = await graphFetch(
+      `${GRAPH}/${attempt.videoId}?fields=status`,
+      {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      },
+    );
+    status = response.status;
+  }
+
+  const phases = [
+    status?.uploading_phase,
+    status?.processing_phase,
+    status?.publishing_phase,
+  ];
+  if (
+    status?.video_status === "error" ||
+    phases.some((phase) => phase?.status === "error")
+  ) {
+    throw new Error("Facebook reel processing failed");
+  }
+  if (status?.publishing_phase?.status === "complete") {
+    return facebookPublished(
+      attempt.videoId,
+      accessToken,
+      saveAttempt,
+      `https://www.facebook.com/reel/${attempt.videoId}`,
+    );
+  }
+  if (
+    attempt.finishRequested ||
+    status?.publishing_phase?.status === "in_progress"
+  ) {
+    throw new ResumablePublishError("Facebook reel is still publishing");
+  }
+  if (!status || status.uploading_phase?.status === "not_started") {
+    const uploaded = await graphFetch(attempt.uploadUrl, {
+      method: "POST",
+      headers: {
+        Authorization: `OAuth ${accessToken}`,
+        file_url: mediaUrl(asset),
+      },
+    });
+    if (uploaded.success !== true) {
+      throw new Error("Facebook reel upload was not accepted");
+    }
+  } else if (status.uploading_phase?.status !== "complete") {
+    throw new ResumablePublishError("Facebook reel is still uploading");
+  }
+
+  // Finishing starts encoding/publication; do not wait for video_status=ready first.
+  const finished = await graphFetch(endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      upload_phase: "finish",
+      video_id: attempt.videoId,
+      video_state: "PUBLISHED",
+      description: effectiveCaption(post.body, target.bodyOverride),
+      ...(target.platformSettings?.title
+        ? { title: target.platformSettings.title }
+        : {}),
+      access_token: accessToken,
+    }),
+  });
+  if (finished.success !== true) {
+    throw new Error("Facebook reel publication was not accepted");
+  }
+  await saveAttempt?.({ ...attempt, finishRequested: true });
+  throw new ResumablePublishError("Facebook reel is still publishing");
 }
 
 export async function publishToFacebook(
@@ -111,6 +225,10 @@ export async function publishToFacebook(
   const pageId = account.providerAccountId;
   if (!pageId || typeof pageId !== "string")
     throw new Error("Facebook Page ID missing");
+
+  if (post.kind === "video" && target.platformSettings?.placement === "reel") {
+    return publishFacebookReel(params);
+  }
 
   if (post.kind === "text" && media.length === 0) {
     const data = await graphFetch(`${GRAPH}/${pageId}/feed`, {
@@ -263,7 +381,7 @@ export async function publishToFacebook(
           caption: body,
         }),
       });
-      const id = data.id ?? data.post_id;
+      const id = data.post_id ?? data.id;
       if (!id) throw new Error("Facebook photo: no id");
       return facebookPublished(
         id,
