@@ -8,11 +8,12 @@ import {
   pagesToFacebookOptions,
 } from "./shared";
 
-const SCOPES = [
+// Comment management is optional: a Page can connect and publish without
+// pages_manage_engagement being included in the Business Login configuration.
+const REQUIRED_SCOPES = [
   "pages_show_list",
   "pages_read_engagement",
   "pages_manage_posts",
-  "pages_manage_engagement",
   "pages_read_user_content",
   "read_insights",
   "pages_manage_metadata",
@@ -32,7 +33,9 @@ export const facebookConnector: SocialConnector = {
 
   async exchangeCode(input) {
     const tokens = await metaExchangeCode(input);
-    const missing = SCOPES.filter((scope) => !tokens.scopes.includes(scope));
+    const missing = REQUIRED_SCOPES.filter(
+      (scope) => !tokens.scopes.includes(scope),
+    );
     if (missing.length) {
       throw new Error(`Missing Facebook permissions: ${missing.join(", ")}`);
     }
