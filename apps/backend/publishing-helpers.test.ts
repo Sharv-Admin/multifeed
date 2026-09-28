@@ -133,8 +133,8 @@ test("resumable publish errors stay in progress instead of failed", () => {
 
 test("old X and TikTok tokens are treated as missing publish scopes", () => {
   assert.deepEqual(missingPublishScopes("x", ["tweet.write"]), ["media.write"]);
-  assert.deepEqual(missingPublishScopes("tiktok", ["video.publish"]), [
-    "video.upload",
+  assert.deepEqual(missingPublishScopes("tiktok", ["video.upload"]), [
+    "video.publish",
   ]);
   assert.deepEqual(missingPublishScopes("x", []), [
     "tweet.write",

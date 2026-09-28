@@ -118,7 +118,7 @@ export function isResumablePublishError(error: unknown) {
 
 const REQUIRED_PUBLISH_SCOPES: Record<string, string[]> = {
   x: ["tweet.write", "media.write"],
-  tiktok: ["video.publish", "video.upload"],
+  tiktok: ["video.publish"],
   threads: ["threads_content_publish"],
   facebook: ["pages_manage_posts"],
   instagram: ["instagram_content_publish"],

@@ -2,12 +2,7 @@ import { requireEnv } from "../env";
 import { oauthFetch } from "./http";
 import type { SocialConnector, TokenBundle } from "./types";
 
-const SCOPES = [
-  "user.info.basic",
-  "user.info.profile",
-  "video.publish",
-  "video.upload",
-];
+const SCOPES = ["user.info.basic", "user.info.profile", "video.publish"];
 const TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/";
 
 const credentials = () => ({
