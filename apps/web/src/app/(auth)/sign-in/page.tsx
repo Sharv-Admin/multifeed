@@ -181,7 +181,7 @@ export default function SignInPage() {
                 <InputOTPSlot
                   key={index}
                   index={index}
-                  className="ml-2 first:ml-0"
+                  className="ml-1.5 size-10 rounded-xl border border-solid border-zinc-300 bg-white text-lg font-semibold text-zinc-950 shadow-sm first:ml-0 data-[active=true]:border-primary data-[active=true]:ring-2 data-[active=true]:ring-primary/20"
                 />
               ))}
             </InputOTPGroup>
