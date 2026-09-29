@@ -68,6 +68,28 @@ export default function PrivacyPage() {
           the service. We may also use essential cookies and similar storage for
           authentication, session continuity, preferences, and security.
         </p>
+        <h3>Optional website analytics</h3>
+        <p>
+          If you choose “Allow analytics,” we use Google Analytics to measure
+          visits to our public website, including pages viewed, browser and
+          device information, and referral sources. We do not load Google
+          Analytics before you opt in, and we do not use it on sign-in pages or
+          within your dashboard. We do not send your email address, sign-in
+          codes, social posts, or URL query strings to Google Analytics.
+          Advertising personalization and Google signals are disabled.
+        </p>
+        <p>
+          You can decline analytics without losing access to MultiFeed. You can
+          change your choice using “Cookie preferences” at the bottom of any
+          public website page. We remember that choice for up to six months;
+          declining after accepting removes our analytics cookies. Google
+          processes analytics data on our behalf and may process it outside your
+          country. See{" "}
+          <a href="https://policies.google.com/privacy">
+            Google’s privacy policy
+          </a>{" "}
+          for more information.
+        </p>
       </section>
 
       <section>

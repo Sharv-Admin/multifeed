@@ -1,4 +1,5 @@
 import { SmoothScroll } from "@/components/SmoothScroll";
+import { AnalyticsConsent } from "@/components/marketing/AnalyticsConsent";
 
 export default function MarketingLayout({
   children,
@@ -9,6 +10,7 @@ export default function MarketingLayout({
     <SmoothScroll>
       <div className="flex min-h-screen w-full flex-col bg-background selection:bg-primary selection:text-primary-foreground">
         {children}
+        <AnalyticsConsent />
       </div>
     </SmoothScroll>
   );
