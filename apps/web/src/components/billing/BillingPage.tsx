@@ -43,7 +43,7 @@ const statusLabels: Record<string, string> = {
 
 function statusLabel(status: unknown) {
   return typeof status === "string" && status in statusLabels
-    ? statusLabels[status]
+    ? (statusLabels[status] ?? "Unknown")
     : "Unknown";
 }
 
@@ -69,6 +69,7 @@ export function BillingPage() {
   const checkingOutRef = useRef(false);
   const openingPortalRef = useRef(false);
   const subscription = useQuery(api.billing.getSubscription, { nowMs });
+  const entitlements = useQuery(api.billing.getEntitlements, { nowMs });
   const isYearly = billingInterval === "year";
   const activePlan = subscription?.hasPlanAccess
     ? PLANS.find((plan) => plan.key === subscription.planKey)
@@ -129,8 +130,63 @@ export function BillingPage() {
       });
   };
 
-  if (subscription === undefined) {
+  if (subscription === undefined || entitlements === undefined) {
     return <DashboardLoadingSkeleton variant="billing" />;
+  }
+
+  if (entitlements.accessSource === "super_admin") {
+    return (
+      <div className="flex w-full min-w-0 flex-1 flex-col gap-6">
+        <DashboardPageTitle
+          title="Billing"
+          description="Your complimentary owner access."
+        />
+        <section className="flex flex-col gap-4 rounded-2xl bg-muted p-5 sm:p-6">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <h2 className="font-display text-xl font-semibold tracking-tight text-foreground">
+              Super admin
+            </h2>
+            <span className="rounded-full bg-card px-3 py-1.5 text-sm font-medium text-primary">
+              Complimentary access
+            </span>
+          </div>
+          <p className="text-sm leading-relaxed text-muted-foreground">
+            Agency-level product access for your owner account in this
+            workspace. No subscription purchase is required for this access.
+          </p>
+          <ul className="flex flex-col gap-2 text-sm text-foreground">
+            <li>
+              {entitlements.connectedAccountLimit} connected social accounts
+            </li>
+            <li>{entitlements.teamSeatLimit} additional team seats</li>
+            <li>Unlimited scheduled posts</li>
+          </ul>
+          <p className="text-sm leading-relaxed text-muted-foreground">
+            This exception does not grant access to other customers’ workspaces.
+            Normal team permissions still apply.
+          </p>
+          {subscription && (
+            <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border pt-4">
+              <p className="text-sm text-muted-foreground">
+                Your existing subscription is{" "}
+                {statusLabel(subscription.status).toLowerCase()}. Complimentary
+                access does not cancel it or change its billing.
+              </p>
+              {subscription.dodoCustomerId && (
+                <Button
+                  disabled={openingPortal}
+                  onClick={openCustomerPortal}
+                  variant="secondary"
+                >
+                  {openingPortal ? <Spinner className="size-3" /> : null}
+                  Manage subscription
+                </Button>
+              )}
+            </div>
+          )}
+        </section>
+      </div>
+    );
   }
 
   return (

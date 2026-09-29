@@ -1,5 +1,5 @@
 import DodoPayments from "dodopayments";
-import { fetchMutation } from "convex/nextjs";
+import { fetchMutation, fetchQuery } from "convex/nextjs";
 import { ConvexError } from "convex/values";
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
@@ -108,6 +108,22 @@ export async function POST(request: NextRequest) {
     !isBillingInterval(payload.interval)
   ) {
     return errorResponse("Invalid plan", 400);
+  }
+
+  try {
+    const entitlements = await fetchQuery(
+      api.billing.getEntitlements,
+      { nowMs: Date.now() },
+      { token },
+    );
+    if (entitlements.accessSource === "super_admin") {
+      return errorResponse(
+        "This account already has complimentary owner access",
+        409,
+      );
+    }
+  } catch {
+    return errorResponse("Could not verify account access", 503);
   }
 
   const productId = getDodoProductId(payload.planKey, payload.interval);

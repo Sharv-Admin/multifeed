@@ -16,6 +16,7 @@ import {
   planKey as planKeyValidator,
 } from "./schema";
 import { serializeScope } from "./writeGuards";
+import { hasSuperAdminAccess } from "./superAdminAccess";
 
 /** Subscription statuses that grant product access. */
 export const ACTIVE_BILLING = new Set([
@@ -72,6 +73,11 @@ const SYNC_EVENTS = new Set([
 const PENDING_CHECKOUT_TTL_MS = 30 * 60 * 1000;
 
 export const entitlementValidator = v.object({
+  accessSource: v.union(
+    v.literal("super_admin"),
+    v.literal("subscription"),
+    v.literal("free"),
+  ),
   planKey: v.union(planKeyValidator, v.null()),
   hasActivePlan: v.boolean(),
   connectedAccountLimit: v.number(),
@@ -226,12 +232,25 @@ export async function entitlementsForTeam(
   teamId: string,
   now: number,
 ) {
+  const user = await requireUser(ctx);
+  if (hasSuperAdminAccess(user, teamId)) {
+    const limits = getPlanLimits("agency");
+    return {
+      accessSource: "super_admin" as const,
+      planKey: "agency" as const,
+      hasActivePlan: true,
+      connectedAccountLimit: limits.connectedAccounts,
+      teamSeatLimit: limits.teamSeats,
+    };
+  }
+
   const sub = await latestForTeam(ctx, teamId, now);
   const plan =
     sub && grantsPlanAccess(sub, now) ? asPlan(sub.planKey) : undefined;
   const limits = getPlanLimits(plan ?? null);
 
   return {
+    accessSource: plan ? ("subscription" as const) : ("free" as const),
     planKey: plan ?? null,
     hasActivePlan: plan !== undefined,
     connectedAccountLimit: limits.connectedAccounts,
@@ -306,6 +325,9 @@ export const beginCheckout = mutation({
   }),
   handler: async (ctx, args) => {
     const user = await requireUser(ctx);
+    if (hasSuperAdminAccess(user, user.selectedTeamId)) {
+      fail("CONFLICT", "This account already has complimentary owner access");
+    }
     const now = Date.now();
     await serializeScope(ctx, `billing-checkout:${user.selectedTeamId}`);
 
