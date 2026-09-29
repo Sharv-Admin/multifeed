@@ -35,6 +35,7 @@ export function InviteModal({
   const [email, setEmail] = useState("");
   const [isOpen, setIsOpen] = useState(false);
   const [isSending, setIsSending] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const sendingRef = useRef(false);
   const usedSeats = countUsedTeamSeats(membersCount, invitationsCount);
   const isAtLimit = teamSeatLimit !== undefined && usedSeats >= teamSeatLimit;
@@ -42,10 +43,12 @@ export function InviteModal({
   const reset = () => {
     setEmail("");
     setIsSending(false);
+    setErrorMessage(null);
     sendingRef.current = false;
   };
 
   const handleOpenChange = (open: boolean) => {
+    if (!open && sendingRef.current) return;
     setIsOpen(open);
     if (!open) reset();
   };
@@ -55,6 +58,7 @@ export function InviteModal({
     if (sendingRef.current) return;
     sendingRef.current = true;
     setIsSending(true);
+    setErrorMessage(null);
 
     void fetch("/api/team-members", {
       method: "POST",
@@ -65,14 +69,18 @@ export function InviteModal({
         const payload = (await response.json().catch(() => ({}))) as
           | { ok: true }
           | { error?: string };
-        if (!response.ok || !("ok" in payload)) {
+        if (!response.ok || !("ok" in payload) || payload.ok !== true) {
           throw new Error(
             "error" in payload && payload.error
               ? payload.error
               : "Could not send team invitation",
           );
         }
-        await team.listInvitations();
+        // The invitation is already sent; a refresh failure must not encourage
+        // the user to send a duplicate invitation.
+        await team.listInvitations().catch(() => {
+          console.warn("Could not refresh the team invitation list");
+        });
         setIsOpen(false);
         reset();
         toast.success("Invite sent.");
@@ -80,7 +88,9 @@ export function InviteModal({
       .catch((err) => {
         sendingRef.current = false;
         setIsSending(false);
-        toast.error(err instanceof Error ? err.message : String(err));
+        setErrorMessage(
+          err instanceof Error ? err.message : "Could not send team invitation",
+        );
       });
   };
 
@@ -111,10 +121,24 @@ export function InviteModal({
                 autoFocus
                 placeholder="teammate@company.com"
                 value={email}
-                onChange={(event) => setEmail(event.target.value)}
+                disabled={isSending}
+                aria-describedby={errorMessage ? "invite-error" : undefined}
+                onChange={(event) => {
+                  setEmail(event.target.value);
+                  setErrorMessage(null);
+                }}
               />
               {isAtLimit && (
                 <p className="text-sm text-muted-foreground">No seats left.</p>
+              )}
+              {errorMessage && (
+                <p
+                  id="invite-error"
+                  role="alert"
+                  className="text-sm text-destructive"
+                >
+                  {errorMessage}
+                </p>
               )}
             </div>
           </div>
@@ -133,7 +157,7 @@ export function InviteModal({
               type="submit"
             >
               {isSending ? <Spinner className="size-4" /> : <Email size={16} />}
-              Send invite
+              {isSending ? "Sending invite…" : "Send invite"}
             </Button>
           </DialogFooter>
         </form>

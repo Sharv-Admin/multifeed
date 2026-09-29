@@ -7,7 +7,7 @@ import {
   getHexclaveConvexServerToken,
   hexclaveServerApp,
 } from "@/hexclave/server";
-import { assertSameOrigin } from "@/lib/oauth/env";
+import { appOrigin, assertSameOrigin } from "@/lib/oauth/env";
 import { countUsedTeamSeats } from "@/lib/team-seats";
 import { currentTimeBucket } from "@/lib/time-bucket";
 
@@ -99,7 +99,15 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    await team.inviteUser({ email });
+    await team.inviteUser({
+      email,
+      // Server-side invitations cannot resolve a relative URL from a browser.
+      // Use the configured app origin, never an untrusted request Host header.
+      callbackUrl: new URL(
+        hexclaveServerApp.urls.teamInvitation,
+        appOrigin(),
+      ).toString(),
+    });
     return NextResponse.json({ ok: true }, { status: 201, ...responseOptions });
   } catch (error) {
     console.error(
