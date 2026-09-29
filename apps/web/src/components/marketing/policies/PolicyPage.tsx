@@ -11,10 +11,16 @@ const LAST_UPDATED = "July 21, 2026";
 type PolicyPageProps = {
   children: React.ReactNode;
   description: string;
+  lastUpdated?: string;
   title: string;
 };
 
-export function PolicyPage({ children, description, title }: PolicyPageProps) {
+export function PolicyPage({
+  children,
+  description,
+  lastUpdated = LAST_UPDATED,
+  title,
+}: PolicyPageProps) {
   return (
     <main className="min-h-screen bg-background px-5 py-8 text-foreground sm:px-8">
       <div className="mx-auto max-w-3xl">
@@ -32,7 +38,7 @@ export function PolicyPage({ children, description, title }: PolicyPageProps) {
 
         <article className="py-12 sm:py-16">
           <p className="text-sm font-medium text-primary">
-            Effective and last updated {LAST_UPDATED}
+            Effective and last updated {lastUpdated}
           </p>
           <h1 className="mt-3 font-display text-4xl font-bold tracking-tight sm:text-5xl">
             {title}

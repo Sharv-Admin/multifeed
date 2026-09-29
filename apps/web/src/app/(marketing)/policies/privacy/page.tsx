@@ -23,6 +23,7 @@ export default function PrivacyPage() {
   return (
     <PolicyPage
       description="This policy explains what information MultiFeed handles, why we use it, and the choices available to you when you use our website and social media management service."
+      lastUpdated="September 29, 2026"
       title="Privacy Policy"
     >
       <section>
