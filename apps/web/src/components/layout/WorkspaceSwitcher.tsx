@@ -12,7 +12,8 @@ import { selectVerifiedWorkspace } from "@/lib/select-verified-workspace";
 
 type Workspace = { id: string; displayName: string };
 
-export function WorkspaceSwitcher() {
+// Call from the persistent profile parent, never from the dismissible popup.
+export function useWorkspaceSwitcher() {
   const user = hexclaveClientApp.useUser();
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [loading, setLoading] = useState(true);
@@ -62,6 +63,32 @@ export function WorkspaceSwitcher() {
     }
   };
 
+  return {
+    workspaces,
+    loading,
+    switching,
+    error,
+    currentTeamId: user?.selectedTeam?.id,
+    select,
+    reloadWorkspaces: () => setReload((value) => value + 1),
+  };
+}
+
+export function WorkspaceSwitcher({
+  state,
+}: {
+  state: ReturnType<typeof useWorkspaceSwitcher>;
+}) {
+  const {
+    workspaces,
+    loading,
+    switching,
+    error,
+    currentTeamId,
+    select,
+    reloadWorkspaces,
+  } = state;
+
   return (
     <DropdownMenuGroup aria-label="Workspaces">
       <DropdownMenuLabel>Workspaces</DropdownMenuLabel>
@@ -71,7 +98,7 @@ export function WorkspaceSwitcher() {
         </p>
       ) : null}
       {workspaces.map((workspace) => {
-        const current = workspace.id === user?.selectedTeam?.id;
+        const current = workspace.id === currentTeamId;
         return (
           <DropdownMenuItem
             key={workspace.id}
@@ -111,7 +138,7 @@ export function WorkspaceSwitcher() {
             <DropdownMenuItem
               closeOnClick={false}
               disabled={loading}
-              onClick={() => setReload((value) => value + 1)}
+              onClick={reloadWorkspaces}
             >
               Reload workspaces
             </DropdownMenuItem>

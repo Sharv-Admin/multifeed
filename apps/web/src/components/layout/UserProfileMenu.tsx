@@ -19,7 +19,7 @@ import {
 } from "@multifeed/ui/components/dropdown-menu";
 import { Tabs, TabsList, TabsTrigger } from "@multifeed/ui/components/tabs";
 import { hexclaveClientApp } from "@/hexclave/client";
-import { WorkspaceSwitcher } from "./WorkspaceSwitcher";
+import { WorkspaceSwitcher, useWorkspaceSwitcher } from "./WorkspaceSwitcher";
 
 export type ProfileUser = {
   displayName: string | null;
@@ -38,6 +38,7 @@ const getInitials = (value: string | null) =>
 export function UserProfileMenu({ user }: { user: ProfileUser }) {
   const router = useRouter();
   const { resolvedTheme, setTheme } = useTheme();
+  const workspaceState = useWorkspaceSwitcher();
   const initials =
     getInitials(user.displayName) || getInitials(user.primaryEmail);
   const isDark = resolvedTheme === "dark";
@@ -83,7 +84,7 @@ export function UserProfileMenu({ user }: { user: ProfileUser }) {
           </div>
         </div>
         <DropdownMenuSeparator />
-        <WorkspaceSwitcher />
+        <WorkspaceSwitcher state={workspaceState} />
         <DropdownMenuSeparator />
         <div className="flex items-center gap-2 px-2 py-1">
           <span className="flex items-center gap-2 text-sm">
