@@ -1,6 +1,7 @@
 {
   "extends": "@multifeed/typescript-config/nextjs.json",
   "compilerOptions": {
+    "allowImportingTsExtensions": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "plugins": [

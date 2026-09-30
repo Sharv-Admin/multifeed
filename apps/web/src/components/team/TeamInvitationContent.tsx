@@ -9,6 +9,7 @@ import {
   acceptAndSelectInvitedTeam,
   invitationErrorMessage,
 } from "@/lib/accept-team-invitation";
+import { selectVerifiedWorkspace } from "@/lib/select-verified-workspace";
 
 type Workspace = { id: string; displayName: string };
 
@@ -56,10 +57,7 @@ export function TeamInvitationContent({ code }: { code: string }) {
     setIsLoading(true);
     setError(null);
     try {
-      // User-scoped lookup checks membership before changing workspace.
-      const team = await user.getTeam(teamId);
-      if (!team) throw new Error("Workspace membership unavailable");
-      await user.setSelectedTeam(team.id);
+      await selectVerifiedWorkspace(user, teamId);
       // A full navigation drops client query caches from the old workspace.
       window.location.replace("/overview");
     } catch {

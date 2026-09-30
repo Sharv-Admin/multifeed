@@ -451,7 +451,6 @@ async function reconcileStatus(ctx: MutationCtx, postId: Doc<"posts">["_id"]) {
     return null;
   }
   const hasPublished = targets.some((target) => target.status === "published");
-  const hasFailed = targets.some((target) => target.status === "failed");
   const hasPublishing = targets.some(
     (target) =>
       target.status === "publishing" ||
@@ -460,9 +459,9 @@ async function reconcileStatus(ctx: MutationCtx, postId: Doc<"posts">["_id"]) {
   );
   const status: Doc<"posts">["status"] = hasPublishing
     ? "publishing"
-    : !hasPublished && hasFailed
-      ? "failed"
-      : "published";
+    : hasPublished
+      ? "published"
+      : "failed";
   await ctx.db.patch("posts", postId, { status, updatedAt: Date.now() });
   return null;
 }
