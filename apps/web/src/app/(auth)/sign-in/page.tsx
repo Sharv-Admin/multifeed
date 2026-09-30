@@ -107,9 +107,9 @@ export default function SignInPage() {
   const handleGoogleSignIn = async () => {
     setIsGoogleLoading(true);
     try {
-      await app.signInWithOAuth("google", {
-        returnTo: app.urls.afterSignIn,
-      });
+      // Let Hexclave preserve its validated invitation return path. Ordinary
+      // sign-ins still use the configured afterSignIn destination.
+      await app.signInWithOAuth("google");
     } catch {
       toast.error("Could not continue with Google. Please try again.");
     } finally {
