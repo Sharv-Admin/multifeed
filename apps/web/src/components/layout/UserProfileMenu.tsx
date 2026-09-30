@@ -19,6 +19,7 @@ import {
 } from "@multifeed/ui/components/dropdown-menu";
 import { Tabs, TabsList, TabsTrigger } from "@multifeed/ui/components/tabs";
 import { hexclaveClientApp } from "@/hexclave/client";
+import { WorkspaceSwitcher } from "./WorkspaceSwitcher";
 
 export type ProfileUser = {
   displayName: string | null;
@@ -81,6 +82,8 @@ export function UserProfileMenu({ user }: { user: ProfileUser }) {
             )}
           </div>
         </div>
+        <DropdownMenuSeparator />
+        <WorkspaceSwitcher />
         <DropdownMenuSeparator />
         <div className="flex items-center gap-2 px-2 py-1">
           <span className="flex items-center gap-2 text-sm">
