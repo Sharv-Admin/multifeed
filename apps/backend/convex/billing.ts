@@ -139,13 +139,14 @@ function webhookStatus(
   if (mapped) return mapped;
 
   if (SYNC_EVENTS.has(eventType)) {
-    // Only generic sync events consult the payload status, and only when it is
-    // a status we actually model.
+    // Generic changes are not activation signals. Normalize provider states
+    // we do not model, and preserve stored truth when status is absent/unknown.
     const rawStatus = firstNonEmptyString(event.status);
+    if (rawStatus === "paused" || rawStatus === "past_due") return "on_hold";
     if (rawStatus && (STATUSES as readonly string[]).includes(rawStatus)) {
       return rawStatus as BillingStatus;
     }
-    return "updated";
+    return undefined;
   }
 
   return undefined;
