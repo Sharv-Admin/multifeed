@@ -143,9 +143,7 @@ function PostTableRow({
   post: PostListItem;
   retrying: boolean;
 }) {
-  const canRetry =
-    post.status === "failed" ||
-    post.targets.some((target) => target.status === "failed");
+  const canRetry = post.targets.some((target) => target.status === "failed");
   const permalinks = post.targets.filter((target) => target.platformPermalink);
   const FormatIcon =
     POST_FORMATS.find((format) => format.id === post.kind)?.icon ?? File;

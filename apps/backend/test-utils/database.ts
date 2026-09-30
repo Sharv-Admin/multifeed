@@ -64,6 +64,10 @@ export function testDatabase(seed: Record<string, any[]> = {}) {
     ctx: {
       db,
       scheduler: {
+        runAt: async (when: number, _fn: unknown, args: unknown) => {
+          jobs.push({ delay: when - Date.now(), args });
+          return `job-${jobs.length}`;
+        },
         runAfter: async (delay: number, _fn: unknown, args: unknown) => {
           jobs.push({ delay, args });
           return `job-${jobs.length}`;
