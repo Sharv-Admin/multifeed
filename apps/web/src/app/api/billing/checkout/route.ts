@@ -1,4 +1,4 @@
-import DodoPayments from "dodopayments";
+import Stripe from "stripe";
 import { fetchMutation, fetchQuery } from "convex/nextjs";
 import { ConvexError } from "convex/values";
 import { NextResponse } from "next/server";
@@ -7,9 +7,9 @@ import { api } from "@convex/_generated/api";
 import type { Id } from "@convex/_generated/dataModel";
 import { type BillingInterval, type PlanKey } from "@multifeed/plans";
 import {
-  getDodoApiKey,
-  getDodoEnvironment,
-  getDodoProductId,
+  getBillingServerSecret,
+  getStripePriceId,
+  getStripeSecretKey,
 } from "@/lib/billing-config";
 import {
   getHexclaveConvexServerToken,
@@ -37,6 +37,7 @@ const convexErrorStatus = (error: unknown): number | null => {
   if (code === "CONFLICT") return 409;
   if (code === "UNAUTHENTICATED") return 401;
   if (code === "FORBIDDEN") return 403;
+  if (code === "INVALID_INPUT") return 400;
   return 500;
 };
 
@@ -126,28 +127,20 @@ export async function POST(request: NextRequest) {
     return errorResponse("Could not verify account access", 503);
   }
 
-  const productId = getDodoProductId(payload.planKey, payload.interval);
-  const apiKey = getDodoApiKey();
+  const priceId = getStripePriceId(payload.planKey, payload.interval);
+  const secretKey = getStripeSecretKey();
+  const serverSecret = getBillingServerSecret();
 
-  if (!productId) {
+  if (!priceId) {
     console.error(
-      `[billing/checkout] no Dodo product configured for plan=${payload.planKey} interval=${payload.interval}`,
+      `[billing/checkout] no Stripe price configured for plan=${payload.planKey} interval=${payload.interval}`,
     );
     return errorResponse("Billing is not configured", 500);
   }
 
-  if (!apiKey) {
-    console.error("[billing/checkout] DODO_PAYMENTS_API_KEY is not configured");
-    return errorResponse("Billing is not configured", 500);
-  }
-
-  let environment: ReturnType<typeof getDodoEnvironment>;
-  try {
-    environment = getDodoEnvironment();
-  } catch (error) {
+  if (!secretKey || !serverSecret) {
     console.error(
-      "[billing/checkout]",
-      error instanceof Error ? error.message : error,
+      "[billing/checkout] STRIPE_SECRET_KEY or BILLING_SERVER_SECRET is missing or invalid",
     );
     return errorResponse("Billing is not configured", 500);
   }
@@ -157,6 +150,10 @@ export async function POST(request: NextRequest) {
   let intent: {
     checkoutIntentId: Id<"billingSubscriptions">;
     checkoutUrl?: string;
+    stripeCustomerId?: string;
+    userId: string;
+    teamId: string;
+    checkoutExpiresAt: number;
   };
   try {
     intent = await fetchMutation(
@@ -164,7 +161,9 @@ export async function POST(request: NextRequest) {
       {
         planKey: payload.planKey,
         interval: payload.interval,
-        dodoProductId: productId,
+        stripePriceId: priceId,
+        serverSecret,
+        expectedTeamId: team.id,
       },
       { token },
     );
@@ -186,7 +185,7 @@ export async function POST(request: NextRequest) {
   }
 
   // A pending checkout for the same plan already has a URL — resume it
-  // instead of creating a second Dodo session.
+  // instead of creating a second Stripe session.
   if (intent.checkoutUrl) {
     return NextResponse.json(
       { checkoutUrl: intent.checkoutUrl },
@@ -194,59 +193,100 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  const abandonCheckout = () =>
-    fetchMutation(api.billing.abandonCheckout, {}, { token }).catch(
-      (error: unknown) => {
-        console.error(
-          "[billing/abandon-checkout]",
-          error instanceof Error ? error.message : error,
-        );
+  const origin = appOrigin();
+  const client = new Stripe(secretKey, { maxNetworkRetries: 2 });
+  const metadata = {
+    teamId: intent.teamId,
+    orgId: intent.teamId,
+    userId: intent.userId,
+    planKey: payload.planKey,
+    interval: payload.interval,
+    checkoutIntentId: intent.checkoutIntentId,
+  };
+
+  let session: Stripe.Checkout.Session;
+  let customerId = intent.stripeCustomerId;
+  if (intent.checkoutExpiresAt < Date.now() + 31 * 60 * 1000) {
+    return errorResponse(
+      "This checkout is expiring. Please try again after it expires",
+      409,
+    );
+  }
+  try {
+    if (!customerId) {
+      const customer = await client.customers.create(
+        { metadata: { teamId: intent.teamId, orgId: intent.teamId } },
+        { idempotencyKey: `billing-customer:${intent.teamId}` },
+      );
+      customerId = customer.id;
+    }
+
+    await fetchMutation(
+      api.billing.rememberStripeCustomer,
+      {
+        checkoutIntentId: intent.checkoutIntentId,
+        stripeCustomerId: customerId,
+        serverSecret,
       },
+      { token },
     );
 
-  const origin = appOrigin();
-  const client = new DodoPayments({
-    bearerToken: apiKey,
-    environment,
-  });
-
-  let session: Awaited<ReturnType<typeof client.checkoutSessions.create>>;
-  try {
-    session = await client.checkoutSessions.create({
-      product_cart: [{ product_id: productId, quantity: 1 }],
-      customer: {
-        email: user.primaryEmail,
-        name: user.displayName,
+    session = await client.checkout.sessions.create(
+      {
+        mode: "subscription",
+        line_items: [{ price: priceId, quantity: 1 }],
+        customer: customerId,
+        client_reference_id: intent.teamId,
+        expires_at: Math.floor(intent.checkoutExpiresAt / 1000),
+        metadata,
+        subscription_data: { metadata },
+        success_url: `${origin}/billing?checkout=complete`,
+        cancel_url: `${origin}/billing?checkout=cancelled`,
       },
-      metadata: {
-        teamId: team.id,
-        userId: user.id,
-        planKey: payload.planKey,
-        interval: payload.interval,
-      },
-      return_url: `${origin}/billing?checkout=complete`,
-      cancel_url: `${origin}/billing?checkout=cancelled`,
-    });
+      { idempotencyKey: `billing-checkout:${intent.checkoutIntentId}` },
+    );
   } catch (error) {
     console.error(
       "[billing/checkout]",
       error instanceof Error ? error.message : error,
     );
-    await abandonCheckout();
+    // A timeout can happen after Stripe creates the session. Preserve this
+    // intent so retries use the same idempotency key and cannot double bill.
+    if (
+      error instanceof Stripe.errors.StripeInvalidRequestError &&
+      error.code !== "idempotency_key_in_use" &&
+      error.code !== "lock_timeout"
+    ) {
+      await fetchMutation(
+        api.billing.abandonCheckout,
+        {
+          checkoutIntentId: intent.checkoutIntentId,
+          serverSecret,
+        },
+        { token },
+      ).catch(() => {
+        console.error(
+          "[billing/checkout] could not clear rejected checkout intent",
+        );
+      });
+    }
     return errorResponse("Could not start checkout", 502);
   }
 
-  if (!session.checkout_url) {
-    await abandonCheckout();
-    return errorResponse("Dodo did not return a checkout URL", 502);
+  if (!session.url) {
+    return errorResponse("Stripe did not return a checkout URL", 502);
   }
 
   try {
     await fetchMutation(
       api.billing.completeCheckout,
       {
-        checkoutSessionId: session.session_id,
-        checkoutUrl: session.checkout_url,
+        checkoutIntentId: intent.checkoutIntentId,
+        checkoutSessionId: session.id,
+        checkoutUrl: session.url,
+        checkoutExpiresAt: session.expires_at * 1000,
+        stripeCustomerId: customerId,
+        serverSecret,
       },
       { token },
     );
@@ -255,10 +295,8 @@ export async function POST(request: NextRequest) {
       "[billing/complete-checkout]",
       error instanceof Error ? error.message : error,
     );
+    return errorResponse("Could not save checkout. Please try again", 503);
   }
 
-  return NextResponse.json(
-    { checkoutUrl: session.checkout_url },
-    responseOptions,
-  );
+  return NextResponse.json({ checkoutUrl: session.url }, responseOptions);
 }

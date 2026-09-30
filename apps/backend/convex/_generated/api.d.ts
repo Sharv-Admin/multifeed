@@ -9,6 +9,7 @@
  */
 
 import type * as billing from "../billing.js";
+import type * as billingConfig from "../billingConfig.js";
 import type * as billingWebhook from "../billingWebhook.js";
 import type * as crons from "../crons.js";
 import type * as errors from "../errors.js";
@@ -34,6 +35,7 @@ import type * as publishing_tiktok from "../publishing/tiktok.js";
 import type * as publishing_tokenRefresh from "../publishing/tokenRefresh.js";
 import type * as publishing_x from "../publishing/x.js";
 import type * as publishing_youtube from "../publishing/youtube.js";
+import type * as superAdminAccess from "../superAdminAccess.js";
 import type * as writeGuards from "../writeGuards.js";
 
 import type {
@@ -44,6 +46,7 @@ import type {
 
 declare const fullApi: ApiFromModules<{
   billing: typeof billing;
+  billingConfig: typeof billingConfig;
   billingWebhook: typeof billingWebhook;
   crons: typeof crons;
   errors: typeof errors;
@@ -69,6 +72,7 @@ declare const fullApi: ApiFromModules<{
   "publishing/tokenRefresh": typeof publishing_tokenRefresh;
   "publishing/x": typeof publishing_x;
   "publishing/youtube": typeof publishing_youtube;
+  superAdminAccess: typeof superAdminAccess;
   writeGuards: typeof writeGuards;
 }>;
 
@@ -101,4 +105,5 @@ export declare const internal: FilterApi<
 export declare const components: {
   stack_auth: import("@hexclave/next/_generated/component.js").ComponentApi<"stack_auth">;
   r2: import("@convex-dev/r2/_generated/component.js").ComponentApi<"r2">;
+  stripe: import("@convex-dev/stripe/_generated/component.js").ComponentApi<"stripe">;
 };

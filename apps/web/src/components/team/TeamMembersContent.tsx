@@ -3,14 +3,14 @@
 import { api } from "@convex/_generated/api";
 import type { CurrentUser, Team } from "@hexclave/next";
 import { useQuery } from "convex-helpers/react/cache/hooks";
-import { Suspense, useState } from "react";
+import { Suspense } from "react";
 import { DashboardPageTitle } from "@/components/layout/DashboardPageTitle";
 import { InviteModal } from "@/components/team/InviteModal";
 import { TeamMembersTable } from "@/components/team/TeamMembersTable";
 import { InviteMemberFallback } from "@/components/team/TeamPageSkeleton";
 import { TeamStats, TeamStatsSkeleton } from "@/components/team/TeamStats";
 import { TeamTableSkeleton } from "@/components/team/TeamTableSkeleton";
-import { currentTimeBucket } from "@/lib/time-bucket";
+import { useCurrentTimeBucket } from "@/lib/use-current-time-bucket";
 
 type TeamTableRow = {
   email: string | null;
@@ -67,7 +67,7 @@ function TeamInviteAction({ team, user }: { team: Team; user: CurrentUser }) {
   const canInviteMembers = user.usePermission(team, "$invite_members") != null;
   const members = team.useUsers();
   const invitations = team.useInvitations();
-  const [nowMs] = useState(() => currentTimeBucket());
+  const nowMs = useCurrentTimeBucket();
   const entitlements = useQuery(api.billing.getEntitlements, { nowMs });
 
   if (!canInviteMembers) return null;
@@ -86,7 +86,7 @@ function TeamMembersData({ team, user }: { team: Team; user: CurrentUser }) {
   const canReadMembers = user.usePermission(team, "$read_members") != null;
   const members = team.useUsers();
   const invitations = team.useInvitations();
-  const [nowMs] = useState(() => currentTimeBucket());
+  const nowMs = useCurrentTimeBucket();
   const entitlements = useQuery(api.billing.getEntitlements, { nowMs });
 
   if (!canReadMembers) {

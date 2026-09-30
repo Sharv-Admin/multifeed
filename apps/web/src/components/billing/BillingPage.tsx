@@ -5,6 +5,7 @@ import { Card, Check } from "@honeyicons/react";
 import type { BillingInterval, PlanKey } from "@multifeed/plans";
 import { PLANS } from "@multifeed/plans";
 import { useQuery } from "convex-helpers/react/cache/hooks";
+import type { FunctionReturnType } from "convex/server";
 import { type CSSProperties, useRef, useState } from "react";
 import { toast } from "sonner";
 import { DashboardLoadingSkeleton } from "@/components/layout/DashboardLoadingSkeleton";
@@ -12,7 +13,7 @@ import { DashboardPageTitle } from "@/components/layout/DashboardPageTitle";
 import { Button } from "@multifeed/ui/components/button";
 import { Spinner } from "@multifeed/ui/components/spinner";
 import { Switch } from "@multifeed/ui/components/switch";
-import { currentTimeBucket } from "@/lib/time-bucket";
+import { useCurrentTimeBucket } from "@/lib/use-current-time-bucket";
 
 const intervalLabels = {
   month: "/month",
@@ -31,6 +32,13 @@ const freePlan = {
 
 const statusLabels: Record<string, string> = {
   active: "Active",
+  trialing: "Trial",
+  past_due: "Payment overdue",
+  canceled: "Cancelled",
+  incomplete: "Payment pending",
+  incomplete_expired: "Checkout expired",
+  unpaid: "Unpaid",
+  paused: "Paused",
   cancelled: "Cancelled",
   expired: "Expired",
   failed: "Failed",
@@ -58,8 +66,36 @@ function formatDate(value?: number) {
   return dateFormatter.format(new Date(value));
 }
 
+type BillingSubscription = NonNullable<
+  FunctionReturnType<typeof api.billing.getSubscription>
+>;
+
+function billingPeriodLabel(subscription: BillingSubscription) {
+  if (!subscription.hasPlanAccess) return statusLabel(subscription.status);
+
+  const accessEnd = formatDate(
+    subscription.accessEndsAt ?? subscription.currentPeriodEnd,
+  );
+  if (subscription.billingProvider === "dodo" && accessEnd) {
+    return `Access until ${accessEnd}`;
+  }
+  if (
+    (subscription.cancelAtPeriodEnd ||
+      subscription.accessEndsAt !== undefined) &&
+    accessEnd
+  ) {
+    return `Ends ${accessEnd}`;
+  }
+
+  const periodEnd = formatDate(subscription.currentPeriodEnd);
+  if (!periodEnd) return statusLabel(subscription.status);
+  return subscription.status === "trialing"
+    ? `Trial ends ${periodEnd}`
+    : `Renews ${periodEnd}`;
+}
+
 export function BillingPage() {
-  const [nowMs] = useState(() => currentTimeBucket());
+  const nowMs = useCurrentTimeBucket();
   const [billingInterval, setBillingInterval] =
     useState<BillingInterval>("month");
   const [checkingOut, setCheckingOut] = useState<PlanKey | null>(null);
@@ -87,12 +123,11 @@ export function BillingPage() {
       body: JSON.stringify({ planKey, interval: billingInterval }),
     })
       .then(async (response) => {
-        if (!response.ok) throw new Error("Could not start checkout");
         const payload = (await response.json()) as {
           checkoutUrl?: string;
           error?: string;
         };
-        if (!payload.checkoutUrl) {
+        if (!response.ok || !payload.checkoutUrl) {
           throw new Error(payload.error ?? "Could not start checkout");
         }
         window.location.assign(payload.checkoutUrl);
@@ -113,12 +148,11 @@ export function BillingPage() {
       headers: { "Content-Type": "application/json" },
     })
       .then(async (response) => {
-        if (!response.ok) throw new Error("Could not open billing portal");
         const payload = (await response.json()) as {
           url?: string;
           error?: string;
         };
-        if (!payload.url) {
+        if (!response.ok || !payload.url) {
           throw new Error(payload.error ?? "Could not open billing portal");
         }
         window.location.assign(payload.url);
@@ -172,15 +206,29 @@ export function BillingPage() {
                 {statusLabel(subscription.status).toLowerCase()}. Complimentary
                 access does not cancel it or change its billing.
               </p>
-              {subscription.dodoCustomerId && (
-                <Button
-                  disabled={openingPortal}
-                  onClick={openCustomerPortal}
-                  variant="secondary"
-                >
-                  {openingPortal ? <Spinner className="size-3" /> : null}
-                  Manage subscription
-                </Button>
+              {subscription.billingProvider === "stripe" &&
+                subscription.stripeCustomerId && (
+                  <Button
+                    disabled={openingPortal}
+                    onClick={openCustomerPortal}
+                    variant="secondary"
+                  >
+                    {openingPortal ? <Spinner className="size-3" /> : null}
+                    Manage subscription
+                  </Button>
+                )}
+              {subscription.billingProvider === "dodo" && (
+                <p className="text-sm text-muted-foreground">
+                  To manage your existing Dodo subscription or move it to
+                  Stripe,{" "}
+                  <a
+                    className="underline underline-offset-4"
+                    href="mailto:support@themultifeed.com"
+                  >
+                    contact support
+                  </a>
+                  .
+                </p>
               )}
             </div>
           )}
@@ -214,25 +262,35 @@ export function BillingPage() {
         <div className="flex shrink-0 items-center gap-2">
           {subscription && (
             <span className="rounded-full bg-card px-3 py-1.5 text-sm font-medium text-foreground">
-              {subscription.hasPlanAccess &&
-              subscription.status !== "cancelled" &&
-              formatDate(subscription.currentPeriodEnd)
-                ? `Renews ${formatDate(subscription.currentPeriodEnd)}`
-                : statusLabel(subscription.status)}
+              {billingPeriodLabel(subscription)}
             </span>
           )}
-          {subscription?.dodoCustomerId && (
-            <Button
-              disabled={openingPortal}
-              onClick={openCustomerPortal}
-              variant="secondary"
-            >
-              {openingPortal ? <Spinner className="size-3" /> : null}
-              Manage subscription
-            </Button>
-          )}
+          {subscription?.billingProvider === "stripe" &&
+            subscription.stripeCustomerId && (
+              <Button
+                disabled={openingPortal}
+                onClick={openCustomerPortal}
+                variant="secondary"
+              >
+                {openingPortal ? <Spinner className="size-3" /> : null}
+                Manage subscription
+              </Button>
+            )}
         </div>
       </section>
+
+      {subscription?.billingProvider === "dodo" && (
+        <p className="text-sm text-muted-foreground">
+          To manage your existing Dodo subscription or move it to Stripe,{" "}
+          <a
+            className="underline underline-offset-4"
+            href="mailto:support@themultifeed.com"
+          >
+            contact support
+          </a>
+          .
+        </p>
+      )}
 
       <div className="flex flex-wrap items-center justify-between gap-3">
         <p className="text-sm text-muted-foreground">Billing interval</p>

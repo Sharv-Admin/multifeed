@@ -9,9 +9,20 @@ export const planKey = v.union(
 
 export const billingInterval = v.union(v.literal("month"), v.literal("year"));
 
-export const billingStatus = v.union(
-  v.literal("pending"),
+export const stripeBillingStatus = v.union(
   v.literal("active"),
+  v.literal("trialing"),
+  v.literal("past_due"),
+  v.literal("canceled"),
+  v.literal("incomplete"),
+  v.literal("incomplete_expired"),
+  v.literal("unpaid"),
+  v.literal("paused"),
+);
+
+export const billingStatus = v.union(
+  stripeBillingStatus,
+  v.literal("pending"),
   v.literal("renewed"),
   v.literal("updated"),
   v.literal("plan_changed"),
@@ -192,9 +203,23 @@ export default defineSchema({
     planKey,
     interval: billingInterval,
     status: billingStatus,
+    billingProvider: v.optional(
+      v.union(v.literal("stripe"), v.literal("dodo")),
+    ),
+    stripeSubscriptionId: v.optional(v.string()),
+    stripeCustomerId: v.optional(v.string()),
+    stripePriceId: v.optional(v.string()),
+    stripeCheckoutSessionId: v.optional(v.string()),
+    stripeCheckoutUrl: v.optional(v.string()),
+    checkoutExpiresAt: v.optional(v.number()),
+    cancelAtPeriodEnd: v.optional(v.boolean()),
+    planVerified: v.optional(v.boolean()),
+    paymentVerified: v.optional(v.boolean()),
+    lastSyncedAt: v.optional(v.number()),
+    // Retain legacy columns so existing paid rows can survive the cutover.
     dodoSubscriptionId: v.optional(v.string()),
     dodoCustomerId: v.optional(v.string()),
-    dodoProductId: v.string(),
+    dodoProductId: v.optional(v.string()),
     dodoCheckoutSessionId: v.optional(v.string()),
     dodoCheckoutUrl: v.optional(v.string()),
     currentPeriodEnd: v.optional(v.number()),
@@ -204,6 +229,7 @@ export default defineSchema({
     updatedAt: v.number(),
   })
     .index("by_team_status_updated", ["teamId", "status", "updatedAt"])
+    .index("by_stripe_subscription", ["stripeSubscriptionId"])
     .index("by_subscription", ["dodoSubscriptionId"])
     .index("by_customer", ["dodoCustomerId"]),
 
@@ -216,6 +242,21 @@ export default defineSchema({
     subscriptionId: v.optional(v.string()),
     rawEvent: v.any(),
   }).index("by_webhook_id", ["webhookId"]),
+
+  billingCustomers: defineTable({
+    teamId: v.string(),
+    stripeCustomerId: v.string(),
+    createdAt: v.number(),
+  })
+    .index("by_team", ["teamId"])
+    .index("by_stripe_customer", ["stripeCustomerId"]),
+
+  stripeWebhookEvents: defineTable({
+    eventId: v.string(),
+    eventType: v.string(),
+    subscriptionId: v.optional(v.string()),
+    processedAt: v.number(),
+  }).index("by_event_id", ["eventId"]),
 
   oauthSessions: defineTable({
     state: v.string(),

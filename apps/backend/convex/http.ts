@@ -1,63 +1,83 @@
-import { parseDodoWebhook } from "./billingWebhook";
+import { registerRoutes } from "@convex-dev/stripe";
 import { httpRouter } from "convex/server";
-import { internal } from "./_generated/api";
-import { httpAction } from "./_generated/server";
-import { parseTime } from "./billing";
+import type Stripe from "stripe";
+import { components, internal } from "./_generated/api";
 
 const http = httpRouter();
 
-function json(body: unknown, status = 200) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { "Content-Type": "application/json" },
-  });
+function stripeObjectId(value: string | { id: string } | null | undefined) {
+  return typeof value === "string" ? value : value?.id;
 }
 
-http.route({
-  path: "/webhook/dodopayment",
-  method: "POST",
-  handler: httpAction(async (ctx, request) => {
-    const webhookKey =
-      process.env.DODO_PAYMENTS_WEBHOOK_SECRET ??
-      process.env.DODO_PAYMENTS_WEBHOOK_KEY;
-    if (!webhookKey) return json({ error: "Missing webhook key" }, 500);
+function invoiceSubscriptionId(invoice: Stripe.Invoice) {
+  const subscription = invoice.parent?.subscription_details?.subscription;
+  if (subscription) return stripeObjectId(subscription);
 
-    const rawBody = await request.text();
-    const webhookId = request.headers.get("webhook-id") ?? "";
-    const signature = request.headers.get("webhook-signature") ?? "";
-    const timestamp = request.headers.get("webhook-timestamp") ?? "";
+  // Events retain the API version configured on the Stripe destination.
+  const legacyInvoice = invoice as Stripe.Invoice & {
+    subscription?: string | Stripe.Subscription | null;
+  };
+  return stripeObjectId(legacyInvoice.subscription);
+}
 
-    let event: ReturnType<typeof parseDodoWebhook>;
-    try {
-      event = parseDodoWebhook(
-        rawBody,
-        {
-          "webhook-id": webhookId,
-          "webhook-signature": signature,
-          "webhook-timestamp": timestamp,
-        },
-        webhookKey,
-      );
-    } catch {
-      console.error("[Dodo webhook] verification failed");
-      return json({ error: "Invalid webhook" }, 401);
+registerRoutes(http, components.stripe, {
+  webhookPath: "/stripe/webhook",
+  apiVersion: "2026-08-26.dahlia",
+  onEvent: async (ctx, event) => {
+    switch (event.type) {
+      case "customer.subscription.created":
+      case "customer.subscription.updated":
+      case "customer.subscription.paused":
+      case "customer.subscription.resumed":
+        await ctx.runAction(internal.billingWebhook.syncEvent, {
+          eventId: event.id,
+          eventType: event.type,
+          subscriptionId: event.data.object.id,
+        });
+        break;
+      case "customer.subscription.deleted": {
+        const subscription = event.data.object;
+        const customerId = stripeObjectId(subscription.customer);
+        await ctx.runAction(internal.billingWebhook.syncEvent, {
+          eventId: event.id,
+          eventType: event.type,
+          subscriptionId: subscription.id,
+          deletedSubscription: customerId
+            ? {
+                customerId,
+                teamId: subscription.metadata.teamId,
+                userId: subscription.metadata.userId,
+                checkoutIntentId: subscription.metadata.checkoutIntentId,
+              }
+            : undefined,
+        });
+        break;
+      }
+      case "invoice.paid":
+      case "invoice.payment_succeeded":
+      case "invoice.payment_failed": {
+        const subscriptionId = invoiceSubscriptionId(event.data.object);
+        if (subscriptionId) {
+          await ctx.runAction(internal.billingWebhook.syncEvent, {
+            eventId: event.id,
+            eventType: event.type,
+            subscriptionId,
+          });
+        }
+        break;
+      }
+      case "checkout.session.completed":
+      case "checkout.session.async_payment_succeeded":
+      case "checkout.session.async_payment_failed":
+      case "checkout.session.expired":
+        await ctx.runAction(internal.billingWebhook.syncEvent, {
+          eventId: event.id,
+          eventType: event.type,
+          checkoutSessionId: event.data.object.id,
+        });
+        break;
     }
-
-    try {
-      await ctx.runMutation(internal.billing.handleWebhook, {
-        webhookId,
-        eventType: event.type,
-        eventTimestamp: parseTime(event.timestamp) ?? parseTime(timestamp),
-        rawEvent: event,
-        data: event.data ?? {},
-      });
-
-      return json({ received: true });
-    } catch (error) {
-      console.error("[Dodo webhook] processing failed", error);
-      return json({ error: "Webhook processing failed" }, 500);
-    }
-  }),
+  },
 });
 
 export default http;

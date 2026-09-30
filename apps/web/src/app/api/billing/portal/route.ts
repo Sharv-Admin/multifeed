@@ -1,9 +1,9 @@
-import DodoPayments from "dodopayments";
+import Stripe from "stripe";
 import { fetchQuery } from "convex/nextjs";
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 import { api } from "@convex/_generated/api";
-import { getDodoApiKey, getDodoEnvironment } from "@/lib/billing-config";
+import { getStripeSecretKey } from "@/lib/billing-config";
 import {
   getHexclaveConvexServerToken,
   hexclaveServerApp,
@@ -75,20 +75,9 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  const apiKey = getDodoApiKey();
-  if (!apiKey) {
-    console.error("[billing/portal] DODO_PAYMENTS_API_KEY is not configured");
-    return errorResponse("Billing is not configured", 500);
-  }
-
-  let environment: ReturnType<typeof getDodoEnvironment>;
-  try {
-    environment = getDodoEnvironment();
-  } catch (error) {
-    console.error(
-      "[billing/portal]",
-      error instanceof Error ? error.message : error,
-    );
+  const secretKey = getStripeSecretKey();
+  if (!secretKey) {
+    console.error("[billing/portal] STRIPE_SECRET_KEY is missing or invalid");
     return errorResponse("Billing is not configured", 500);
   }
 
@@ -103,29 +92,34 @@ export async function POST(request: NextRequest) {
     return errorResponse("Could not verify subscription status", 503);
   }
 
-  if (!subscription?.dodoCustomerId) {
+  if (subscription && subscription.teamId !== team.id) {
+    return errorResponse(
+      "The selected team changed. Refresh and try again",
+      409,
+    );
+  }
+
+  if (
+    subscription?.billingProvider !== "stripe" ||
+    !subscription.stripeCustomerId
+  ) {
     return errorResponse("No active customer billing portal found", 404);
   }
 
   const origin = appOrigin();
-  const client = new DodoPayments({
-    bearerToken: apiKey,
-    environment,
-  });
+  const client = new Stripe(secretKey, { maxNetworkRetries: 2 });
 
   try {
-    const portalSession = await client.customers.customerPortal.create(
-      subscription.dodoCustomerId,
-      {
-        return_url: `${origin}/billing`,
-      },
-    );
+    const portalSession = await client.billingPortal.sessions.create({
+      customer: subscription.stripeCustomerId,
+      return_url: `${origin}/billing`,
+    });
 
-    if (!portalSession?.link) {
-      return errorResponse("Dodo did not return a portal link", 502);
+    if (!portalSession.url) {
+      return errorResponse("Stripe did not return a portal link", 502);
     }
 
-    return NextResponse.json({ url: portalSession.link }, responseOptions);
+    return NextResponse.json({ url: portalSession.url }, responseOptions);
   } catch (error) {
     console.error(
       "[billing/portal]",

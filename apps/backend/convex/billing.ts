@@ -1,5 +1,5 @@
 import { v } from "convex/values";
-import { getPlanLimits, type PlanKey } from "@multifeed/plans";
+import { getPlanLimits } from "@multifeed/plans";
 import type { Doc } from "./_generated/dataModel";
 import {
   internalMutation,
@@ -8,19 +8,25 @@ import {
   type MutationCtx,
   type QueryCtx,
 } from "./_generated/server";
+import {
+  getStripePlan,
+  getStripePriceId,
+  requireBillingServer,
+} from "./billingConfig";
 import { fail } from "./errors";
 import { requireUser } from "./hexclave/auth";
 import {
   billingInterval,
   billingStatus,
+  stripeBillingStatus,
   planKey as planKeyValidator,
 } from "./schema";
 import { serializeScope } from "./writeGuards";
 import { hasSuperAdminAccess } from "./superAdminAccess";
 
-/** Subscription statuses that grant product access. */
 export const ACTIVE_BILLING = new Set([
   "active",
+  "trialing",
   "renewed",
   "updated",
   "plan_changed",
@@ -29,6 +35,13 @@ export const ACTIVE_BILLING = new Set([
 const STATUSES = [
   "pending",
   "active",
+  "trialing",
+  "past_due",
+  "canceled",
+  "incomplete",
+  "incomplete_expired",
+  "unpaid",
+  "paused",
   "renewed",
   "updated",
   "plan_changed",
@@ -38,39 +51,8 @@ const STATUSES = [
   "expired",
 ] as const;
 
-type BillingStatus = (typeof STATUSES)[number];
-
-/**
- * Lifecycle events whose type alone determines the resulting status. The
- * payload's `status` field is deliberately ignored for these — the event type
- * is the authoritative signal.
- *
- * Dodo emits `subscription.paused`/`unpaused`; the schema has no `paused`
- * literal, so paused maps to `on_hold` (also non-entitled and recoverable).
- */
-const EVENT_STATUS: Record<string, BillingStatus> = {
-  "subscription.active": "active",
-  "subscription.renewed": "renewed",
-  "subscription.plan_changed": "plan_changed",
-  "subscription.cancelled": "cancelled",
-  "subscription.on_hold": "on_hold",
-  "subscription.paused": "on_hold",
-  "subscription.failed": "failed",
-  "subscription.expired": "expired",
-};
-
-/**
- * Generic sync events — fired on any field change — where the payload's
- * `status` describes the subscription's actual state.
- */
-const SYNC_EVENTS = new Set([
-  "subscription.updated",
-  "subscription.unpaused",
-  "subscription.update_payment_method",
-]);
-
-/** How long a checkout intent may sit pending before it stops blocking. */
-const PENDING_CHECKOUT_TTL_MS = 30 * 60 * 1000;
+// Stripe expiry is fixed when the intent is created, including delayed retries.
+const PENDING_CHECKOUT_TTL_MS = 23 * 60 * 60 * 1000;
 
 export const entitlementValidator = v.object({
   accessSource: v.union(
@@ -86,101 +68,62 @@ export const entitlementValidator = v.object({
 
 const subscriptionSnapshotValidator = v.union(
   v.object({
+    teamId: v.string(),
     planKey: planKeyValidator,
     interval: billingInterval,
     status: billingStatus,
+    billingProvider: v.union(v.literal("stripe"), v.literal("dodo")),
     hasPlanAccess: v.boolean(),
     canStartCheckout: v.boolean(),
-    dodoCustomerId: v.optional(v.string()),
+    stripeCustomerId: v.optional(v.string()),
     currentPeriodEnd: v.optional(v.number()),
     accessEndsAt: v.optional(v.number()),
+    cancelAtPeriodEnd: v.optional(v.boolean()),
     updatedAt: v.number(),
   }),
   v.null(),
 );
 
-function firstNonEmptyString(...values: unknown[]) {
-  for (const value of values) {
-    if (typeof value === "string" && value.length > 0) return value;
-  }
-  return undefined;
-}
-
-export function parseTime(value: unknown): number | undefined {
-  if (typeof value === "number" && !Number.isNaN(value)) {
-    return value > 1e11 ? value : value * 1000;
-  }
-  if (typeof value === "string") {
-    const num = Number(value);
-    if (!Number.isNaN(num) && value.trim() !== "") {
-      return num > 1e11 ? num : num * 1000;
-    }
-    const parsed = Date.parse(value);
-    if (!Number.isNaN(parsed)) return parsed;
-  }
-  return undefined;
-}
-
-function asPlan(value: unknown): PlanKey | undefined {
-  return value === "creator" || value === "growth" || value === "agency"
-    ? value
-    : undefined;
-}
-
-function asInterval(value: unknown) {
-  return value === "month" || value === "year" ? value : undefined;
-}
-
-function webhookStatus(
-  eventType: string,
-  event: Record<string, unknown>,
-): BillingStatus | undefined {
-  const mapped = EVENT_STATUS[eventType];
-  if (mapped) return mapped;
-
-  if (SYNC_EVENTS.has(eventType)) {
-    // Only generic sync events consult the payload status, and only when it is
-    // a status we actually model.
-    const rawStatus = firstNonEmptyString(event.status);
-    if (rawStatus && (STATUSES as readonly string[]).includes(rawStatus)) {
-      return rawStatus as BillingStatus;
-    }
-    return "updated";
-  }
-
-  return undefined;
-}
-
 export function grantsPlanAccess(
-  sub: Pick<Doc<"billingSubscriptions">, "status" | "accessEndsAt">,
+  sub: Pick<
+    Doc<"billingSubscriptions">,
+    | "status"
+    | "accessEndsAt"
+    | "billingProvider"
+    | "stripeSubscriptionId"
+    | "currentPeriodEnd"
+    | "planVerified"
+    | "paymentVerified"
+  >,
   now: number,
 ) {
+  if (sub.billingProvider === "stripe" || sub.stripeSubscriptionId) {
+    return (
+      sub.planVerified === true &&
+      sub.paymentVerified === true &&
+      sub.currentPeriodEnd !== undefined &&
+      sub.currentPeriodEnd > now &&
+      (sub.status === "active" || sub.status === "trialing") &&
+      (sub.accessEndsAt === undefined || sub.accessEndsAt > now)
+    );
+  }
+  // Honor legacy subscriptions through their known paid period at cutover.
+  const end = sub.accessEndsAt ?? sub.currentPeriodEnd;
   return (
-    ACTIVE_BILLING.has(sub.status) ||
-    (sub.status === "cancelled" &&
-      sub.accessEndsAt !== undefined &&
-      sub.accessEndsAt > now)
+    (ACTIVE_BILLING.has(sub.status) || sub.status === "cancelled") &&
+    end !== undefined &&
+    end > now
   );
 }
 
-/**
- * Only terminal or suspended subscriptions may be replaced with a new checkout.
- * `on_hold` (failed renewal) grants no access, so a fresh checkout is allowed.
- */
 export function canStartCheckout(
-  sub: Pick<Doc<"billingSubscriptions">, "status" | "accessEndsAt">,
+  sub: Doc<"billingSubscriptions">,
   now: number,
 ) {
-  return (
-    sub.status === "failed" ||
-    sub.status === "expired" ||
-    sub.status === "on_hold" ||
-    (sub.status === "cancelled" && !grantsPlanAccess(sub, now))
-  );
-}
-
-function statusRank(sub: Doc<"billingSubscriptions">, now: number) {
-  return grantsPlanAccess(sub, now) ? 1 : 0;
+  if (sub.billingProvider === "stripe" || sub.stripeSubscriptionId) {
+    return sub.status === "canceled" || sub.status === "incomplete_expired";
+  }
+  return !grantsPlanAccess(sub, now);
 }
 
 export async function latestForTeam(
@@ -199,32 +142,23 @@ export async function latestForTeam(
         .first(),
     ),
   );
-
   return (
     rows
-      // Local checkout intent is never subscription truth.
       .flatMap((row) =>
-        row?.dodoSubscriptionId && row.status !== "pending" ? [row] : [],
+        row &&
+        (row.stripeSubscriptionId || row.dodoSubscriptionId) &&
+        row.status !== "pending"
+          ? [row]
+          : [],
       )
       .sort(
         (a, b) =>
-          statusRank(b, now) - statusRank(a, now) || b.updatedAt - a.updatedAt,
+          Number(!canStartCheckout(b, now)) -
+            Number(!canStartCheckout(a, now)) ||
+          Number(grantsPlanAccess(b, now)) - Number(grantsPlanAccess(a, now)) ||
+          b.updatedAt - a.updatedAt,
       )[0] ?? null
   );
-}
-
-function snapshot(sub: Doc<"billingSubscriptions">, now: number) {
-  return {
-    planKey: sub.planKey,
-    interval: sub.interval,
-    status: sub.status,
-    hasPlanAccess: grantsPlanAccess(sub, now),
-    canStartCheckout: canStartCheckout(sub, now),
-    dodoCustomerId: sub.dodoCustomerId,
-    currentPeriodEnd: sub.currentPeriodEnd,
-    accessEndsAt: sub.accessEndsAt,
-    updatedAt: sub.updatedAt,
-  };
 }
 
 export async function entitlementsForTeam(
@@ -245,45 +179,54 @@ export async function entitlementsForTeam(
   }
 
   const sub = await latestForTeam(ctx, teamId, now);
-  const plan =
-    sub && grantsPlanAccess(sub, now) ? asPlan(sub.planKey) : undefined;
-  const limits = getPlanLimits(plan ?? null);
-
+  const plan = sub && grantsPlanAccess(sub, now) ? sub.planKey : null;
+  const limits = getPlanLimits(plan);
   return {
     accessSource: plan ? ("subscription" as const) : ("free" as const),
-    planKey: plan ?? null,
-    hasActivePlan: plan !== undefined,
+    planKey: plan,
+    hasActivePlan: plan !== null,
     connectedAccountLimit: limits.connectedAccounts,
     teamSeatLimit: limits.teamSeats,
   };
 }
 
-/** Current plan limits for the authenticated team. */
 export const getEntitlements = query({
   args: { nowMs: v.number() },
   returns: entitlementValidator,
-  handler: async (ctx, args) => {
+  handler: async (ctx) => {
     const user = await requireUser(ctx);
-    return await entitlementsForTeam(ctx, user.selectedTeamId, args.nowMs);
+    return await entitlementsForTeam(ctx, user.selectedTeamId, Date.now());
   },
 });
 
-/** Current team subscription snapshot (or null). */
 export const getSubscription = query({
   args: { nowMs: v.number() },
   returns: subscriptionSnapshotValidator,
-  handler: async (ctx, args) => {
+  handler: async (ctx) => {
     const user = await requireUser(ctx);
-    const sub = await latestForTeam(ctx, user.selectedTeamId, args.nowMs);
-    return sub ? snapshot(sub, args.nowMs) : null;
+    const now = Date.now();
+    const sub = await latestForTeam(ctx, user.selectedTeamId, now);
+    return sub
+      ? {
+          teamId: sub.teamId,
+          planKey: sub.planKey,
+          interval: sub.interval,
+          status: sub.status,
+          billingProvider: sub.stripeSubscriptionId
+            ? ("stripe" as const)
+            : ("dodo" as const),
+          hasPlanAccess: grantsPlanAccess(sub, now),
+          canStartCheckout: canStartCheckout(sub, now),
+          stripeCustomerId: sub.stripeCustomerId,
+          currentPeriodEnd: sub.currentPeriodEnd,
+          accessEndsAt: sub.accessEndsAt,
+          cancelAtPeriodEnd: sub.cancelAtPeriodEnd,
+          updatedAt: sub.updatedAt,
+        }
+      : null;
   },
 });
 
-/**
- * Latest local checkout intent (status `pending`) for a team. These rows are
- * never subscription truth — `latestForTeam` ignores them — they only record
- * that a checkout was initiated so webhooks can be tied back to it.
- */
 async function latestPendingCheckout(
   ctx: QueryCtx | MutationCtx,
   teamId: string,
@@ -297,315 +240,395 @@ async function latestPendingCheckout(
     .first();
 }
 
-/**
- * Record checkout intent before creating a Dodo session. Must be called by the
- * Next.js checkout route BEFORE `checkoutSessions.create`:
- *
- *   1. `beginCheckout` — fails CONFLICT if a non-terminal subscription or a
- *      fresh pending checkout exists. Resumes (returns the stored URL) when the
- *      pending intent already has a checkout URL for the same plan.
- *   2. Create the Dodo checkout session.
- *   3. `completeCheckout` — stamps `dodoCheckoutSessionId`/`dodoCheckoutUrl`
- *      onto the intent row (or pass them directly to `beginCheckout` if the
- *      session already exists).
- *   4. On Dodo failure, `abandonCheckout` clears the intent so the team is not
- *      blocked for the pending TTL.
- */
+async function rememberCustomer(
+  ctx: MutationCtx,
+  teamId: string,
+  stripeCustomerId: string,
+) {
+  const [teamCustomer, customerTeam] = await Promise.all([
+    ctx.db
+      .query("billingCustomers")
+      .withIndex("by_team", (q) => q.eq("teamId", teamId))
+      .first(),
+    ctx.db
+      .query("billingCustomers")
+      .withIndex("by_stripe_customer", (q) =>
+        q.eq("stripeCustomerId", stripeCustomerId),
+      )
+      .first(),
+  ]);
+  if (
+    (teamCustomer && teamCustomer.stripeCustomerId !== stripeCustomerId) ||
+    (customerTeam && customerTeam.teamId !== teamId)
+  ) {
+    fail("CONFLICT", "Stripe customer does not belong to this team");
+  }
+  if (!teamCustomer) {
+    await ctx.db.insert("billingCustomers", {
+      teamId,
+      stripeCustomerId,
+      createdAt: Date.now(),
+    });
+  }
+}
+
 export const beginCheckout = mutation({
   args: {
     planKey: planKeyValidator,
     interval: billingInterval,
-    dodoProductId: v.string(),
-    checkoutSessionId: v.optional(v.string()),
-    checkoutUrl: v.optional(v.string()),
+    stripePriceId: v.string(),
+    serverSecret: v.string(),
+    expectedTeamId: v.string(),
   },
   returns: v.object({
     checkoutIntentId: v.id("billingSubscriptions"),
     checkoutUrl: v.optional(v.string()),
+    stripeCustomerId: v.optional(v.string()),
+    userId: v.string(),
+    teamId: v.string(),
+    checkoutExpiresAt: v.number(),
   }),
   handler: async (ctx, args) => {
+    requireBillingServer(args.serverSecret);
     const user = await requireUser(ctx);
+    if (args.expectedTeamId !== user.selectedTeamId) {
+      fail("CONFLICT", "The selected team changed. Refresh and try again");
+    }
     if (hasSuperAdminAccess(user, user.selectedTeamId)) {
       fail("CONFLICT", "This account already has complimentary owner access");
     }
     const now = Date.now();
+    const price = getStripePlan(args.stripePriceId);
+    if (
+      getStripePriceId(args.planKey, args.interval) !== args.stripePriceId ||
+      price?.planKey !== args.planKey ||
+      price.interval !== args.interval
+    ) {
+      fail("INVALID_INPUT", "Invalid Stripe plan price");
+    }
     await serializeScope(ctx, `billing-checkout:${user.selectedTeamId}`);
-
     const sub = await latestForTeam(ctx, user.selectedTeamId, now);
     if (sub && !canStartCheckout(sub, now)) {
       fail(
         "CONFLICT",
-        "An existing subscription must be managed before starting a new checkout",
+        "Manage the existing subscription before starting a new checkout",
       );
     }
-
+    const customer = await ctx.db
+      .query("billingCustomers")
+      .withIndex("by_team", (q) => q.eq("teamId", user.selectedTeamId))
+      .first();
     const pending = await latestPendingCheckout(ctx, user.selectedTeamId);
-    if (pending && now - pending.updatedAt < PENDING_CHECKOUT_TTL_MS) {
+    if (
+      pending &&
+      now <
+        (pending.checkoutExpiresAt ??
+          pending.createdAt + PENDING_CHECKOUT_TTL_MS)
+    ) {
       if (
-        pending.dodoCheckoutUrl &&
+        pending.billingProvider === "stripe" &&
         pending.planKey === args.planKey &&
-        pending.interval === args.interval
+        pending.interval === args.interval &&
+        pending.stripePriceId === args.stripePriceId
       ) {
-        // Same checkout already has a URL — let the client resume it rather
-        // than spawning a second Dodo session.
         return {
           checkoutIntentId: pending._id,
-          checkoutUrl: pending.dodoCheckoutUrl,
+          checkoutUrl: pending.stripeCheckoutUrl,
+          stripeCustomerId:
+            pending.stripeCustomerId ?? customer?.stripeCustomerId,
+          userId: pending.userId,
+          teamId: pending.teamId,
+          checkoutExpiresAt:
+            pending.checkoutExpiresAt ??
+            Math.floor(pending.createdAt / 1000) * 1000 +
+              PENDING_CHECKOUT_TTL_MS,
         };
       }
       fail("CONFLICT", "A checkout is already in progress for this team");
     }
-
-    // A stale pending intent is checkout litter, not subscription truth —
-    // expire it so it cannot be confused with a real subscription later.
     if (pending) {
       await ctx.db.patch("billingSubscriptions", pending._id, {
         status: "expired",
         updatedAt: now,
       });
     }
-
+    const checkoutExpiresAt =
+      Math.floor(now / 1000) * 1000 + PENDING_CHECKOUT_TTL_MS;
     const checkoutIntentId = await ctx.db.insert("billingSubscriptions", {
       teamId: user.selectedTeamId,
       userId: user.id,
       planKey: args.planKey,
       interval: args.interval,
       status: "pending",
-      dodoProductId: args.dodoProductId,
-      dodoCheckoutSessionId: args.checkoutSessionId,
-      dodoCheckoutUrl: args.checkoutUrl,
+      billingProvider: "stripe",
+      stripePriceId: args.stripePriceId,
+      stripeCustomerId: customer?.stripeCustomerId,
+      checkoutExpiresAt,
       createdAt: now,
       updatedAt: now,
     });
-
-    return { checkoutIntentId, checkoutUrl: args.checkoutUrl };
+    return {
+      checkoutIntentId,
+      stripeCustomerId: customer?.stripeCustomerId,
+      userId: user.id,
+      teamId: user.selectedTeamId,
+      checkoutExpiresAt,
+    };
   },
 });
 
-/** Attach the created Dodo session to the team's in-flight checkout intent. */
+export const rememberStripeCustomer = mutation({
+  args: {
+    checkoutIntentId: v.id("billingSubscriptions"),
+    stripeCustomerId: v.string(),
+    serverSecret: v.string(),
+  },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    requireBillingServer(args.serverSecret);
+    const user = await requireUser(ctx);
+    const intent = await ctx.db.get(
+      "billingSubscriptions",
+      args.checkoutIntentId,
+    );
+    if (
+      !intent ||
+      intent.teamId !== user.selectedTeamId ||
+      intent.billingProvider !== "stripe"
+    ) {
+      fail("FORBIDDEN", "Checkout does not belong to this team");
+    }
+    await serializeScope(ctx, `billing-checkout:${intent.teamId}`);
+    await rememberCustomer(ctx, intent.teamId, args.stripeCustomerId);
+    await ctx.db.patch("billingSubscriptions", intent._id, {
+      stripeCustomerId: args.stripeCustomerId,
+    });
+    return null;
+  },
+});
+
 export const completeCheckout = mutation({
   args: {
+    checkoutIntentId: v.id("billingSubscriptions"),
     checkoutSessionId: v.string(),
     checkoutUrl: v.string(),
+    checkoutExpiresAt: v.number(),
+    stripeCustomerId: v.string(),
+    serverSecret: v.string(),
   },
   returns: v.object({ ok: v.literal(true) }),
   handler: async (ctx, args) => {
+    requireBillingServer(args.serverSecret);
     const user = await requireUser(ctx);
-    const now = Date.now();
     await serializeScope(ctx, `billing-checkout:${user.selectedTeamId}`);
-
-    const pending = await latestPendingCheckout(ctx, user.selectedTeamId);
-    if (!pending || now - pending.updatedAt >= PENDING_CHECKOUT_TTL_MS) {
-      fail("CONFLICT", "No checkout is in progress for this team");
+    const intent = await ctx.db.get(
+      "billingSubscriptions",
+      args.checkoutIntentId,
+    );
+    if (
+      !intent ||
+      intent.teamId !== user.selectedTeamId ||
+      intent.billingProvider !== "stripe"
+    ) {
+      fail("FORBIDDEN", "Checkout does not belong to this team");
     }
-
-    await ctx.db.patch("billingSubscriptions", pending._id, {
-      dodoCheckoutSessionId: args.checkoutSessionId,
-      dodoCheckoutUrl: args.checkoutUrl,
-      updatedAt: now,
+    if (
+      (intent.stripeCheckoutSessionId &&
+        intent.stripeCheckoutSessionId !== args.checkoutSessionId) ||
+      !Number.isFinite(args.checkoutExpiresAt)
+    ) {
+      fail("CONFLICT", "Checkout session does not match the existing intent");
+    }
+    await rememberCustomer(ctx, intent.teamId, args.stripeCustomerId);
+    await ctx.db.patch("billingSubscriptions", intent._id, {
+      stripeCheckoutSessionId: args.checkoutSessionId,
+      stripeCheckoutUrl: args.checkoutUrl,
+      stripeCustomerId: args.stripeCustomerId,
+      checkoutExpiresAt: args.checkoutExpiresAt,
+      updatedAt: Date.now(),
     });
     return { ok: true as const };
   },
 });
 
-/** Clear a pending intent when checkout-session creation fails or is aborted. */
 export const abandonCheckout = mutation({
-  args: {},
+  args: {
+    checkoutIntentId: v.id("billingSubscriptions"),
+    serverSecret: v.string(),
+  },
   returns: v.object({ ok: v.literal(true) }),
-  handler: async (ctx) => {
+  handler: async (ctx, args) => {
+    requireBillingServer(args.serverSecret);
     const user = await requireUser(ctx);
-    const now = Date.now();
     await serializeScope(ctx, `billing-checkout:${user.selectedTeamId}`);
-
-    const pending = await latestPendingCheckout(ctx, user.selectedTeamId);
-    if (pending) {
-      await ctx.db.patch("billingSubscriptions", pending._id, {
+    const intent = await ctx.db.get(
+      "billingSubscriptions",
+      args.checkoutIntentId,
+    );
+    if (!intent || intent.teamId !== user.selectedTeamId) {
+      fail("FORBIDDEN", "Checkout does not belong to this team");
+    }
+    if (intent.status === "pending" && !intent.stripeCheckoutSessionId) {
+      await ctx.db.patch("billingSubscriptions", intent._id, {
         status: "expired",
-        updatedAt: now,
+        updatedAt: Date.now(),
       });
     }
     return { ok: true as const };
   },
 });
 
-/** Dodo webhook handler — idempotent by webhookId. */
-export const handleWebhook = internalMutation({
+async function alreadyProcessed(ctx: MutationCtx, eventId: string) {
+  return await ctx.db
+    .query("stripeWebhookEvents")
+    .withIndex("by_event_id", (q) => q.eq("eventId", eventId))
+    .first();
+}
+
+export const syncStripeSubscription = internalMutation({
   args: {
-    webhookId: v.string(),
+    eventId: v.string(),
     eventType: v.string(),
-    eventTimestamp: v.optional(v.number()),
-    rawEvent: v.any(),
-    data: v.any(),
+    subscriptionId: v.string(),
+    customerId: v.string(),
+    teamId: v.optional(v.string()),
+    userId: v.optional(v.string()),
+    checkoutIntentId: v.optional(v.string()),
+    stripePriceId: v.string(),
+    status: stripeBillingStatus,
+    interval: v.optional(billingInterval),
+    planKey: v.optional(planKeyValidator),
+    currentPeriodEnd: v.optional(v.number()),
+    cancelAt: v.optional(v.number()),
+    cancelAtPeriodEnd: v.boolean(),
+    paymentVerified: v.boolean(),
+    observedAt: v.number(),
   },
-  returns: v.object({ duplicate: v.boolean() }),
+  returns: v.null(),
   handler: async (ctx, args) => {
-    await serializeScope(ctx, "billing:webhooks");
-    const seen = await ctx.db
-      .query("dodoWebhookEvents")
-      .withIndex("by_webhook_id", (q) => q.eq("webhookId", args.webhookId))
+    if (await alreadyProcessed(ctx, args.eventId)) return null;
+    const now = Date.now();
+    let existing = await ctx.db
+      .query("billingSubscriptions")
+      .withIndex("by_stripe_subscription", (q) =>
+        q.eq("stripeSubscriptionId", args.subscriptionId),
+      )
       .first();
-
-    if (seen) return { duplicate: true };
-
-    const event = args.data as Record<string, unknown>;
-    const status = webhookStatus(args.eventType, event);
-    const subscriptionId = firstNonEmptyString(
-      event.subscription_id,
-      event.subscriptionId,
-    );
-
-    if (status) {
-      await upsertSubscription(ctx, status, event, args.eventTimestamp);
+    if (!existing && args.checkoutIntentId) {
+      const intentId = ctx.db.normalizeId(
+        "billingSubscriptions",
+        args.checkoutIntentId,
+      );
+      const intent = intentId
+        ? await ctx.db.get("billingSubscriptions", intentId)
+        : null;
+      if (
+        intent?.billingProvider === "stripe" &&
+        (!intent.stripeSubscriptionId ||
+          intent.stripeSubscriptionId === args.subscriptionId)
+      )
+        existing = intent;
     }
-
-    const metadata = (event.metadata ?? {}) as Record<string, unknown>;
-
-    await ctx.db.insert("dodoWebhookEvents", {
-      webhookId: args.webhookId,
+    const teamId = existing?.teamId ?? args.teamId;
+    const userId = existing?.userId ?? args.userId;
+    const configuredPlan = getStripePlan(args.stripePriceId);
+    const planVerified =
+      configuredPlan !== undefined &&
+      configuredPlan.planKey === args.planKey &&
+      configuredPlan.interval === args.interval;
+    const planKey = planVerified ? configuredPlan.planKey : existing?.planKey;
+    const interval = planVerified
+      ? configuredPlan.interval
+      : existing?.interval;
+    const ownershipMatches =
+      existing === null ||
+      existing.stripeSubscriptionId === args.subscriptionId ||
+      ((!args.teamId || args.teamId === existing.teamId) &&
+        (!args.userId || args.userId === existing.userId) &&
+        (!existing.stripeCustomerId ||
+          existing.stripeCustomerId === args.customerId));
+    if (
+      teamId &&
+      userId &&
+      planKey &&
+      interval &&
+      ownershipMatches &&
+      (!existing?.lastSyncedAt || args.observedAt >= existing.lastSyncedAt)
+    ) {
+      await serializeScope(ctx, `billing-checkout:${teamId}`);
+      await rememberCustomer(ctx, teamId, args.customerId);
+      const record = {
+        teamId,
+        userId,
+        planKey,
+        interval,
+        billingProvider: "stripe" as const,
+        stripeSubscriptionId: args.subscriptionId,
+        stripeCustomerId: args.customerId,
+        stripePriceId: args.stripePriceId,
+        status: args.status,
+        planVerified,
+        paymentVerified: args.paymentVerified,
+        currentPeriodEnd: args.currentPeriodEnd,
+        cancelAtPeriodEnd: args.cancelAtPeriodEnd,
+        accessEndsAt:
+          args.cancelAt ??
+          (args.cancelAtPeriodEnd ? args.currentPeriodEnd : undefined),
+        lastSyncedAt: args.observedAt,
+        updatedAt: now,
+      };
+      if (existing)
+        await ctx.db.patch("billingSubscriptions", existing._id, record);
+      else
+        await ctx.db.insert("billingSubscriptions", {
+          ...record,
+          createdAt: now,
+        });
+    }
+    await ctx.db.insert("stripeWebhookEvents", {
+      eventId: args.eventId,
       eventType: args.eventType,
-      processedAt: Date.now(),
-      eventTimestamp: args.eventTimestamp,
-      teamId: firstNonEmptyString(metadata.teamId),
-      subscriptionId,
-      rawEvent: args.rawEvent,
+      subscriptionId: args.subscriptionId,
+      processedAt: now,
     });
-
-    return { duplicate: false };
+    return null;
   },
 });
 
-async function upsertSubscription(
-  ctx: MutationCtx,
-  status: BillingStatus,
-  event: Record<string, unknown>,
-  rawEventTimestamp: number | undefined,
-) {
-  const dodoSubscriptionId = firstNonEmptyString(
-    event.subscription_id,
-    event.subscriptionId,
-  );
-  const metadata = (event.metadata ?? {}) as Record<string, unknown>;
-  const customer = (event.customer ?? {}) as Record<string, unknown>;
-  const metaTeamId = firstNonEmptyString(metadata.teamId);
-  const metaUserId = firstNonEmptyString(metadata.userId);
-  const metaPlan = asPlan(metadata.planKey);
-  const metaInterval = asInterval(metadata.interval);
-  const eventProductId = firstNonEmptyString(event.product_id, event.productId);
-  const eventCustomerId = firstNonEmptyString(
-    event.customer_id,
-    event.customerId,
-    customer.customer_id,
-    customer.customerId,
-  );
-
-  let existing = dodoSubscriptionId
-    ? await ctx.db
-        .query("billingSubscriptions")
-        .withIndex("by_subscription", (q) =>
-          q.eq("dodoSubscriptionId", dodoSubscriptionId),
-        )
-        .first()
-    : null;
-
-  if (existing) {
-    // Checkout metadata is supplied by us at session creation, but never let a
-    // webhook move an existing subscription across teams, users, or customers.
+export const expireStripeCheckout = internalMutation({
+  args: {
+    eventId: v.string(),
+    eventType: v.string(),
+    checkoutIntentId: v.string(),
+    checkoutSessionId: v.string(),
+  },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    if (await alreadyProcessed(ctx, args.eventId)) return null;
+    const intentId = ctx.db.normalizeId(
+      "billingSubscriptions",
+      args.checkoutIntentId,
+    );
+    const intent = intentId
+      ? await ctx.db.get("billingSubscriptions", intentId)
+      : null;
     if (
-      (metaTeamId !== undefined && metaTeamId !== existing.teamId) ||
-      (metaUserId !== undefined && metaUserId !== existing.userId) ||
-      (eventCustomerId !== undefined &&
-        existing.dodoCustomerId !== undefined &&
-        eventCustomerId !== existing.dodoCustomerId)
+      intent?.billingProvider === "stripe" &&
+      intent.status === "pending" &&
+      (!intent.stripeCheckoutSessionId ||
+        intent.stripeCheckoutSessionId === args.checkoutSessionId)
     ) {
-      console.warn(
-        `[billing] ignored event for subscription ${dodoSubscriptionId}: ` +
-          "metadata team/user/customer does not match the stored subscription",
-      );
-      return null;
+      await serializeScope(ctx, `billing-checkout:${intent.teamId}`);
+      await ctx.db.patch("billingSubscriptions", intent._id, {
+        status: "expired",
+        updatedAt: Date.now(),
+      });
     }
-
-    if (
-      existing.rawEventTimestamp &&
-      rawEventTimestamp &&
-      rawEventTimestamp < existing.rawEventTimestamp
-    ) {
-      return existing._id;
-    }
-  }
-
-  // A brand-new subscription: adopt the matching pending checkout intent so the
-  // row written at checkout start becomes the subscription record instead of
-  // leaving a duplicate pending row behind.
-  if (!existing && metaTeamId && metaPlan) {
-    const pending = await latestPendingCheckout(ctx, metaTeamId);
-    if (
-      pending &&
-      pending.planKey === metaPlan &&
-      (metaInterval === undefined || metaInterval === pending.interval) &&
-      (metaUserId === undefined || metaUserId === pending.userId) &&
-      (eventProductId === undefined || eventProductId === pending.dodoProductId)
-    ) {
-      existing = pending;
-    }
-  }
-
-  const teamId = existing?.teamId ?? metaTeamId;
-  const userId = existing?.userId ?? metaUserId;
-  const plan = metaPlan ?? existing?.planKey;
-  const interval = metaInterval ?? existing?.interval;
-  const dodoProductId = eventProductId ?? existing?.dodoProductId;
-
-  if (
-    !dodoSubscriptionId ||
-    !teamId ||
-    !userId ||
-    !plan ||
-    !interval ||
-    !dodoProductId
-  ) {
+    await ctx.db.insert("stripeWebhookEvents", {
+      eventId: args.eventId,
+      eventType: args.eventType,
+      processedAt: Date.now(),
+    });
     return null;
-  }
-
-  const periodEnd =
-    parseTime(event.next_billing_date) ??
-    parseTime(event.current_period_end) ??
-    parseTime(event.expires_at) ??
-    existing?.currentPeriodEnd;
-
-  let accessEndsAt = existing?.accessEndsAt;
-  if (ACTIVE_BILLING.has(status)) {
-    accessEndsAt = undefined;
-  } else if (status === "expired" || status === "failed") {
-    accessEndsAt = Date.now();
-  } else if (status === "cancelled") {
-    accessEndsAt = event.cancel_at_next_billing_date
-      ? periodEnd
-      : (parseTime(event.cancelled_at) ?? Date.now());
-  }
-
-  const now = Date.now();
-  const record = {
-    teamId,
-    userId,
-    planKey: plan,
-    interval,
-    status,
-    dodoSubscriptionId,
-    dodoCustomerId: eventCustomerId ?? existing?.dodoCustomerId,
-    dodoProductId,
-    currentPeriodEnd: periodEnd,
-    accessEndsAt,
-    rawEventTimestamp,
-    updatedAt: now,
-  };
-
-  if (existing) {
-    await ctx.db.patch("billingSubscriptions", existing._id, record);
-    return existing._id;
-  }
-
-  return await ctx.db.insert("billingSubscriptions", {
-    ...record,
-    createdAt: now,
-  });
-}
+  },
+});

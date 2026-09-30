@@ -30,10 +30,10 @@ import {
   type OAuthPlatform,
   PLATFORM_META,
 } from "@/lib/platform-meta";
-import { currentTimeBucket } from "@/lib/time-bucket";
+import { useCurrentTimeBucket } from "@/lib/use-current-time-bucket";
 
 function ConnectionsPageInner() {
-  const [nowMs] = useState(() => currentTimeBucket());
+  const nowMs = useCurrentTimeBucket();
   const pageData = useQuery(api.oauth.accounts.getConnectionsPageData, {
     nowMs,
   });
